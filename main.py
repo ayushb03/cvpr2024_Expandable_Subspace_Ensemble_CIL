@@ -7,20 +7,24 @@ from torch.utils.data import DataLoader, Subset
 import numpy as np
 
 
-# Define transforms for the dataset
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-])
+class CIFAR10Dataset:
+    def __init__(self, batch_size=32):
+        # Define transforms for the dataset
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+        # Load CIFAR-10 Dataset
+        self.train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=self.transform)
+        self.test_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=self.transform)
 
-# Load CIFAR-10 Dataset
-cifar10_train = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-cifar10_test = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+        # Create DataLoader for train and test
+        self.train_loader = DataLoader(self.train_dataset, batch_size=batch_size, shuffle=True)
+        self.test_loader = DataLoader(self.test_dataset, batch_size=batch_size, shuffle=False)
 
-# Create DataLoader for train and test
-train_loader = DataLoader(cifar10_train, batch_size=32, shuffle=True)
-test_loader = DataLoader(cifar10_test, batch_size=32, shuffle=False)
-
+    def get_train_loader(self, task_indices):
+        task_dataset = Subset(self.train_dataset, [i for i, (_, label) in enumerate(self.train_dataset) if label in task_indices])
+        return DataLoader(task_dataset, batch_size=32, shuffle=True)
 
 class SimpleCNN(nn.Module):
     def __init__(self):
@@ -38,6 +42,7 @@ class SimpleCNN(nn.Module):
         x = self.fc1(x)
         return x
 
+
 class Adapter(nn.Module):
     def __init__(self, input_dim, reduction_dim):
         super(Adapter, self).__init__()
@@ -50,7 +55,6 @@ class Adapter(nn.Module):
         activated = self.activation(down)  # shape: [batch_size, reduction_dim]
         up = self.up_projection(activated)  # shape: [batch_size, input_dim]
         return up + x  # Now x is of shape [batch_size, input_dim]
-
 
 
 class EASE(nn.Module):
@@ -89,30 +93,58 @@ class EASE(nn.Module):
         return new_mapped_protos
 
 
-def train(model, data_loader, optimizer, criterion, task_index):
-    model.train()
-    for images, labels in data_loader:
-        # Move images and labels to the same device as the model
-        images, labels = images.to(next(model.parameters()).device), labels.to(next(model.parameters()).device)
-        
-        optimizer.zero_grad()
-        adapted_features, raw_features = model(images, task_index)
-        loss = criterion(adapted_features, labels)
-        loss.backward()
-        optimizer.step()
-        model.extract_prototypes(raw_features, labels, task_index)
+class Trainer:
+    def __init__(self, model, criterion, optimizer):
+        self.model = model
+        self.criterion = criterion
+        self.optimizer = optimizer
 
-def infer(model, images, task_index):
-    model.eval()
-    # Move images to the same device as the model
-    images = images.to(next(model.parameters()).device)
-    
-    with torch.no_grad():
-        adapted_features, _ = model(images, task_index)
-        return adapted_features  # Modify this to return class predictions
+    def train(self, data_loader, task_index):
+        self.model.train()
+        for images, labels in data_loader:
+            # Move images and labels to the same device as the model
+            images, labels = images.to(next(self.model.parameters()).device), labels.to(next(self.model.parameters()).device)
+            
+            self.optimizer.zero_grad()
+            adapted_features, raw_features = self.model(images, task_index)
+            loss = self.criterion(adapted_features, labels)
+            loss.backward()
+            self.optimizer.step()
+            self.model.extract_prototypes(raw_features, labels, task_index)
+
+    def infer(self, images, task_index):
+        self.model.eval()
+        # Move images to the same device as the model
+        images = images.to(next(self.model.parameters()).device)
+        
+        with torch.no_grad():
+            adapted_features, _ = self.model(images, task_index)
+            return adapted_features  # Modify this to return class predictions
+
+
+class Evaluator:
+    def __init__(self, model):
+        self.model = model
+
+    def evaluate(self, data_loader, task_index):
+        correct = 0
+        total = 0
+        self.model.eval()
+        with torch.no_grad():
+            for images, labels in data_loader:
+                images, labels = images.to('cuda'), labels.to('cuda')  # Move both to CUDA
+                adapted_features, _ = self.model(images, task_index)  # Unpack the tuple
+                _, predicted = torch.max(adapted_features, 1)  # Use adapted_features directly
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+        return 100 * correct / total
 
 
 def main(num_tasks=5):
+    # Initialize dataset
+    dataset = CIFAR10Dataset()
+
     # Initialize backbone
     backbone = SimpleCNN()
     
@@ -123,6 +155,9 @@ def main(num_tasks=5):
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.CrossEntropyLoss()
 
+    # Trainer instance
+    trainer = Trainer(model, criterion, optimizer)
+
     # Split CIFAR-10 into tasks
     num_classes_per_task = 10 // num_tasks  # 2 classes per task
     task_indices = np.arange(10)  # All CIFAR-10 classes
@@ -132,27 +167,18 @@ def main(num_tasks=5):
         classes_for_task = task_indices[task_index * num_classes_per_task: (task_index + 1) * num_classes_per_task]
         
         # Create a subset of the dataset for the current task
-        task_dataset = Subset(cifar10_train, [i for i, (_, label) in enumerate(cifar10_train) if label in classes_for_task])
-        train_loader = DataLoader(task_dataset, batch_size=32, shuffle=True)
+        train_loader = dataset.get_train_loader(classes_for_task)
 
         # Train the model on the current task
-        train(model, train_loader, optimizer, criterion, task_index)
+        trainer.train(train_loader, task_index)
         print(f'Trained on task {task_index + 1} with classes {classes_for_task}')
 
+    # Initialize evaluator
+    evaluator = Evaluator(model)
+
     # Evaluate the model
-    correct = 0
-    total = 0
-    model.eval()
-    with torch.no_grad():
-        for images, labels in test_loader:
-            images, labels = images.to('cuda'), labels.to('cuda')  # Move both to CUDA
-            adapted_features, _ = model(images, 0)  # Unpack the tuple
-            _, predicted = torch.max(adapted_features, 1)  # Use adapted_features directly
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-
-    print(f'Accuracy on test set: {100 * correct / total:.2f}%')
-
+    accuracy = evaluator.evaluate(dataset.test_loader, 0)  # Using task_index 0 for evaluation
+    print(f'Accuracy on test set: {accuracy:.2f}%')
 
 
 if __name__ == "__main__":
