@@ -6,7 +6,6 @@ import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Subset
 import numpy as np
-from sklearn.model_selection import train_test_split
 
 # Define Simple CNN Backbone
 class SimpleCNN(nn.Module):
@@ -16,7 +15,7 @@ class SimpleCNN(nn.Module):
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.pool = nn.MaxPool2d(2, 2)
         self.fc1 = nn.Linear(64 * 8 * 8, 128)  # Assuming CIFAR-10 images are 32x32
-        self.output_dim = 128
+        self.output_dim = 128  # Ensure this is correct
 
     def forward(self, x):
         x = self.pool(F.relu(self.conv1(x)))
@@ -26,38 +25,43 @@ class SimpleCNN(nn.Module):
         return x
 
 
+
 # Adapter for task-specific subspace
 class Adapter(nn.Module):
-    def __init__(self, input_dim, reduction_dim):
+    def __init__(self, input_dim, reduction_dim, num_classes):
         super(Adapter, self).__init__()
         self.down_projection = nn.Linear(input_dim, reduction_dim)
         self.activation = nn.ReLU()
         self.up_projection = nn.Linear(reduction_dim, input_dim)
+        self.fc_out = nn.Linear(input_dim, num_classes)
 
     def forward(self, x):
         down = self.down_projection(x)
         activated = self.activation(down)
         up = self.up_projection(activated)
-        return up + x  # Residual connection
+        logits = self.fc_out(up)
+        return logits
+
 
 
 # Main EASE model
 class EASE(nn.Module):
-    def __init__(self, backbone, adapter_dim=16):
+    def __init__(self, backbone, num_classes=10, adapter_dim=16):
         super(EASE, self).__init__()
         self.backbone = backbone
         self.adapters = nn.ModuleList()
         self.adapter_dim = adapter_dim
+        self.num_classes = num_classes  # Store number of classes
         self.prototypes = {}
 
     def add_adapter(self):
         input_dim = self.backbone.output_dim
-        adapter = Adapter(input_dim, self.adapter_dim)
+        adapter = Adapter(input_dim, self.adapter_dim, self.num_classes)  # Pass num_classes
         self.adapters.append(adapter)
 
     def forward(self, x, task_idx):
         features = self.backbone(x)
-        task_features = self.adapters[task_idx](features)
+        task_features = self.adapters[task_idx](features)  # Use task-specific adapter
         return task_features
 
 
@@ -67,53 +71,51 @@ class PrototypeManager:
         self.prototypes = {}
 
     def extract_prototypes(self, model, task_idx, dataset, device):
-        """Extract class prototypes for the current task using the model's adapter."""
         prototypes = {}
-        original_targets = dataset.dataset.targets  # Access the original targets from the dataset
+        original_targets = dataset.dataset.targets
 
         for label in set(original_targets):
             class_indices = [i for i, target in enumerate(original_targets) if target == label]
-            class_data = [dataset.dataset.data[i] for i in class_indices]  # Use indices to get data
+            class_data = [dataset.dataset.data[i] for i in class_indices]
 
-            # Convert images to the correct shape and datatype
             class_features = []
             for x in class_data:
-                # Ensure x is a tensor with shape [3, 32, 32]
                 x_tensor = torch.tensor(x).permute(2, 0, 1).unsqueeze(0).float().to(device)  # [1, 3, 32, 32]
                 class_features.append(model.forward(x_tensor, task_idx).detach())
 
-            prototypes[label] = torch.mean(torch.stack(class_features), dim=0)
+            if class_features:
+                prototypes[label] = torch.mean(torch.stack(class_features), dim=0)
+                print(f"Extracted prototype for class {label}: shape {prototypes[label].shape}")
+            else:
+                print(f"No features extracted for label {label}.")
 
         return prototypes
 
 
     def complement_old_prototypes(self, old_prototypes, new_prototypes):
-        """Complement old prototypes in the new subspace."""
         complemented_prototypes = {}
         similarity_matrix = torch.zeros(len(old_prototypes), len(new_prototypes)).to(next(iter(old_prototypes.values())).device)
 
         old_classes = list(old_prototypes.keys())
         new_classes = list(new_prototypes.keys())
 
-        # Step 1: Compute cosine similarity between old and new prototypes
         for i, old_class in enumerate(old_classes):
             for j, new_class in enumerate(new_classes):
                 if old_class in old_prototypes and new_class in new_prototypes:
-                    # Check for correct dimensions
                     old_proto = old_prototypes[old_class]
                     new_proto = new_prototypes[new_class]
 
-                    if old_proto.dim() == 1 and new_proto.dim() == 1:  # Ensure both are 1D tensors
-                        similarity_matrix[i, j] = torch.cosine_similarity(old_proto.unsqueeze(0), new_proto.unsqueeze(0), dim=1)
-                    else:
-                        print(f"Skipping similarity computation for old class {old_class} and new class {new_class} due to dimension mismatch.")
-                else:
-                    print(f"Prototype missing for old class {old_class} or new class {new_class}.")
+                    print(f"Comparing old class {old_class} with new class {new_class} -> Old shape: {old_proto.shape}, New shape: {new_proto.shape}")
 
-        # Step 2: Normalize the similarity matrix using softmax
+                    # Ensure we are dealing with 1D tensors for cosine similarity
+                    old_proto = old_proto.view(-1)
+                    new_proto = new_proto.view(-1)
+                    similarity_matrix[i, j] = torch.cosine_similarity(old_proto.unsqueeze(0), new_proto.unsqueeze(0), dim=1)
+
+        # Normalize similarity matrix
         similarity_weights = torch.softmax(similarity_matrix, dim=1)
 
-        # Step 3: Reconstruct old prototypes using new class prototypes
+        # Reconstruct old prototypes
         for i, old_class in enumerate(old_classes):
             reconstructed_prototype = torch.zeros_like(new_prototypes[new_classes[0]])
             for j, new_class in enumerate(new_classes):
@@ -121,8 +123,6 @@ class PrototypeManager:
             complemented_prototypes[old_class] = reconstructed_prototype
 
         return complemented_prototypes
-
-
 
 
 # Training the model
@@ -137,14 +137,13 @@ def train_task(model, prototype_manager, dataloader, task_idx, device, epochs=10
         model.train()
         running_loss = 0.0
         for inputs, labels in dataloader:
-            inputs, labels = inputs.to(device), labels.to(device)  # Move inputs and labels to the same device as the model
-            outputs = model(inputs, task_idx)  # Ensure output is on the correct device
-            loss = criterion(outputs, labels)
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs, task_idx)  # Ensure outputs are logits
+            loss = criterion(outputs, labels)  # Calculate loss using outputs
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
             running_loss += loss.item()
 
         avg_loss = running_loss / len(dataloader)
@@ -224,6 +223,7 @@ def main(num_tasks=5, epochs=2, batch_size=32):
                 correct += (predicted == labels).sum().item()
 
     print(f"Overall accuracy on the test set after {num_tasks} tasks: {100 * correct / total:.2f}%")
+
 
 if __name__ == "__main__":
     main(num_tasks=5)
