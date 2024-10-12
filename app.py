@@ -14,8 +14,8 @@ class SimpleCNN(nn.Module):
         self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.pool = nn.MaxPool2d(2, 2)
-        self.fc1 = nn.Linear(64 * 8 * 8, 128)  # Assuming CIFAR-10 images are 32x32
-        self.output_dim = 128  # Ensure this is correct
+        self.fc1 = nn.Linear(64 * 8 * 8, 128)  # CIFAR-10 images are 32x32
+        self.output_dim = 128  
 
     def forward(self, x):
         x = self.pool(F.relu(self.conv1(x)))
@@ -185,25 +185,22 @@ def prepare_dataloaders(task_idx, batch_size=64):
 def main(num_tasks=5, epochs=2, batch_size=32):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Initialize backbone and model
     backbone = SimpleCNN().to(device)
     model = EASE(backbone, adapter_dim=64).to(device)
 
     prototype_manager = PrototypeManager()
 
-    # Loop over the tasks
     for task_index in range(num_tasks):
         print(f"Training on Task {task_index + 1}")
 
-        # Prepare the data for the current task
+        # data prep for current task
         train_loader, test_loader = prepare_dataloaders(task_index, batch_size=batch_size)
 
-        # Train the model on the current task
+        # train model for current task
         train_task(model, prototype_manager, train_loader, task_index, device, epochs=epochs)
 
         print(f"Finished training on task {task_index + 1}")
 
-    # Evaluate the model on the test dataset after all tasks have been trained
     model.eval()
     correct = 0
     total = 0
