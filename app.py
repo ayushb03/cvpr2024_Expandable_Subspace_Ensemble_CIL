@@ -5,222 +5,222 @@ import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Subset
-import numpy as np
 
-# Define Simple CNN Backbone
+
 class SimpleCNN(nn.Module):
     def __init__(self):
         super(SimpleCNN, self).__init__()
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.fc1 = nn.Linear(64 * 8 * 8, 128)  # CIFAR-10 images are 32x32
-        self.output_dim = 128  
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1)  # Output: 16 x 32 x 32
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)  # Output: 16 x 16 x 16
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)  # Output: 32 x 16 x 16
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)  # Output: 32 x 8 x 8
+        self.fc1 = nn.Linear(32 * 8 * 8, 128)  # Fully connected layer
 
     def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(-1, 64 * 8 * 8)  # Flatten
-        x = self.fc1(x)
+        x = self.pool(F.relu(self.conv1(x)))  # Pass through conv1 and pooling
+        x = self.pool2(F.relu(self.conv2(x)))  # Pass through conv2 and pooling
+        x = x.view(x.size(0), -1)  # Flatten
+        x = self.fc1(x)  # Fully connected layer
         return x
 
 
-
-# Adapter for task-specific subspace
 class Adapter(nn.Module):
-    def __init__(self, input_dim, reduction_dim, num_classes):
+    def __init__(self, input_dim, reduction_dim):
         super(Adapter, self).__init__()
-        self.down_projection = nn.Linear(input_dim, reduction_dim)
+        self.down_project = nn.Linear(input_dim, reduction_dim)
         self.activation = nn.ReLU()
-        self.up_projection = nn.Linear(reduction_dim, input_dim)
-        self.fc_out = nn.Linear(input_dim, num_classes)
+        self.up_project = nn.Linear(reduction_dim, input_dim)
 
     def forward(self, x):
-        down = self.down_projection(x)
-        activated = self.activation(down)
-        up = self.up_projection(activated)
-        logits = self.fc_out(up)
+        # Add a residual connection to preserve original features.
+        return x + self.up_project(self.activation(self.down_project(x)))
+
+
+class EASE(nn.Module):
+    def __init__(self, backbone, reduction_dim=64, num_classes=10):
+        super(EASE, self).__init__()
+        self.backbone = backbone  # Backbone model
+        self.adapters = nn.ModuleList()  # Store task-specific adapters
+        self.classifiers = nn.ModuleList()  # Store task-specific classifiers
+        self.reduction_dim = reduction_dim
+        self.num_classes = num_classes
+
+    def add_task(self):
+        """Add a new adapter and classifier for a new task."""
+        input_dim = self.backbone.fc1.out_features  # Use fc1 output directly
+        adapter = Adapter(input_dim, self.reduction_dim)  # Task-specific adapter
+        classifier = nn.Linear(input_dim, self.num_classes)  # Task-specific classifier
+        
+        self.adapters.append(adapter)
+        self.classifiers.append(classifier)
+
+    def forward(self, x, task_idx):
+        """Forward pass through the backbone, adapter, and classifier."""
+        features = self.backbone(x)  # Get features from the backbone
+        adapted_features = self.adapters[task_idx](features)  # Task-specific adapter
+        logits = self.classifiers[task_idx](adapted_features)  # Task-specific classifier
+
         return logits
 
 
-
-# Main EASE model
-class EASE(nn.Module):
-    def __init__(self, backbone, num_classes=10, adapter_dim=16):
-        super(EASE, self).__init__()
-        self.backbone = backbone
-        self.adapters = nn.ModuleList()
-        self.adapter_dim = adapter_dim
-        self.num_classes = num_classes  # Store number of classes
-        self.prototypes = {}
-
-    def add_adapter(self):
-        input_dim = self.backbone.output_dim
-        adapter = Adapter(input_dim, self.adapter_dim, self.num_classes)  # Pass num_classes
-        self.adapters.append(adapter)
-
-    def forward(self, x, task_idx):
-        features = self.backbone(x)
-        task_features = self.adapters[task_idx](features)  # Use task-specific adapter
-        return task_features
-
-
-# Prototype Manager for Few-Shot Learning
 class PrototypeManager:
     def __init__(self):
         self.prototypes = {}
 
     def extract_prototypes(self, model, task_idx, dataset, device):
+        """Extract class prototypes for a specific task."""
+        model.eval()
         prototypes = {}
-        original_targets = dataset.dataset.targets
+        with torch.no_grad():
+            for label in set(dataset.dataset.targets):
+                indices = [i for i, target in enumerate(dataset.dataset.targets) if target == label]
+                data_points = torch.stack([dataset.dataset[i][0] for i in indices]).to(device)
 
-        for label in set(original_targets):
-            class_indices = [i for i, target in enumerate(original_targets) if target == label]
-            class_data = [dataset.dataset.data[i] for i in class_indices]
-
-            class_features = []
-            for x in class_data:
-                x_tensor = torch.tensor(x).permute(2, 0, 1).unsqueeze(0).float().to(device)  # [1, 3, 32, 32]
-                class_features.append(model.forward(x_tensor, task_idx).detach())
-
-            if class_features:
-                prototypes[label] = torch.mean(torch.stack(class_features), dim=0)
-                print(f"Extracted prototype for class {label}: shape {prototypes[label].shape}")
-            else:
-                print(f"No features extracted for label {label}.")
+                # Compute the mean feature vector per class
+                features = model.backbone(data_points)
+                prototype = torch.mean(features, dim=0)
+                prototypes[label] = F.normalize(prototype, p=2, dim=0)  # Normalize
 
         return prototypes
 
-
     def complement_old_prototypes(self, old_prototypes, new_prototypes):
-        complemented_prototypes = {}
-        similarity_matrix = torch.zeros(len(old_prototypes), len(new_prototypes)).to(next(iter(old_prototypes.values())).device)
+        """Synthesize old prototypes in the new subspace using semantic similarity."""
+        complemented = {}
+        similarity_matrix = torch.zeros(len(old_prototypes), len(new_prototypes)).to(
+            next(iter(old_prototypes.values())).device
+        )
 
-        old_classes = list(old_prototypes.keys())
-        new_classes = list(new_prototypes.keys())
+        # Compute pairwise cosine similarity between old and new prototypes
+        for i, old_class in enumerate(old_prototypes):
+            for j, new_class in enumerate(new_prototypes):
+                similarity_matrix[i, j] = torch.cosine_similarity(
+                    old_prototypes[old_class], new_prototypes[new_class], dim=0
+                )
 
-        for i, old_class in enumerate(old_classes):
-            for j, new_class in enumerate(new_classes):
-                if old_class in old_prototypes and new_class in new_prototypes:
-                    old_proto = old_prototypes[old_class]
-                    new_proto = new_prototypes[new_class]
+        # Apply softmax to normalize similarities
+        weights = torch.softmax(similarity_matrix, dim=1)
 
-                    print(f"Comparing old class {old_class} with new class {new_class} -> Old shape: {old_proto.shape}, New shape: {new_proto.shape}")
+        # Reconstruct old prototypes in the new subspace
+        for i, old_class in enumerate(old_prototypes):
+            reconstructed = sum(
+                weights[i, j] * new_prototypes[new_class]
+                for j, new_class in enumerate(new_prototypes)
+            )
+            complemented[old_class] = F.normalize(reconstructed, p=2, dim=0)
 
-                    # Ensure we are dealing with 1D tensors for cosine similarity
-                    old_proto = old_proto.view(-1)
-                    new_proto = new_proto.view(-1)
-                    similarity_matrix[i, j] = torch.cosine_similarity(old_proto.unsqueeze(0), new_proto.unsqueeze(0), dim=1)
-
-        # Normalize similarity matrix
-        similarity_weights = torch.softmax(similarity_matrix, dim=1)
-
-        # Reconstruct old prototypes
-        for i, old_class in enumerate(old_classes):
-            reconstructed_prototype = torch.zeros_like(new_prototypes[new_classes[0]])
-            for j, new_class in enumerate(new_classes):
-                reconstructed_prototype += similarity_weights[i, j] * new_prototypes[new_class]
-            complemented_prototypes[old_class] = reconstructed_prototype
-
-        return complemented_prototypes
+        return complemented
 
 
-# Training the model
+def weighted_inference(model, images, task_idx, prototypes):
+    """Perform weighted inference using multiple subspaces."""
+    device = images.device
+    logits_sum = torch.zeros(images.size(0), model.num_classes).to(device)
+
+    # Extract normalized features from the backbone
+    features = F.normalize(model.backbone(images), p=2, dim=1)
+
+    # Iterate through all adapters used so far
+    for i in range(task_idx + 1):
+        adapted_features = F.normalize(model.adapters[i](features), p=2, dim=1)
+        logits = model.classifiers[i](adapted_features)
+
+        for j, prototype in prototypes.items():
+            similarity = torch.cosine_similarity(adapted_features, prototype.unsqueeze(0), dim=1)
+            logits[:, j] *= similarity  # Reweight logits using prototype similarity
+
+        # Assign higher weight to the current task's adapter
+        weight = 1.0 if i == task_idx else 0.1  # Current task prioritized
+        logits_sum += weight * logits
+
+    return logits_sum
+
+
 def train_task(model, prototype_manager, dataloader, task_idx, device, epochs=10, lr=1e-3):
-    model.add_adapter()  # Add a new adapter for the task
+    model.add_task()  # Add a new adapter and classifier for the task
     optimizer = optim.Adam(model.adapters[task_idx].parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
 
-    model = model.to(device)
+    model.to(device)
 
     for epoch in range(epochs):
         model.train()
-        running_loss = 0.0
+        total_loss = 0.0
+
         for inputs, labels in dataloader:
             inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs, task_idx)  # Ensure outputs are logits
-            loss = criterion(outputs, labels)  # Calculate loss using outputs
+            outputs = model(inputs, task_idx)
+            loss = criterion(outputs, labels)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            running_loss += loss.item()
+            total_loss += loss.item()
 
-        avg_loss = running_loss / len(dataloader)
-        print(f"Epoch [{epoch + 1}/{epochs}] Loss: {avg_loss:.4f}")
+        print(f"Epoch [{epoch + 1}/{epochs}] Loss: {total_loss / len(dataloader):.4f}")
 
-    # Extract new prototypes for the current task
+    # Extract new prototypes and complement old ones
     new_prototypes = prototype_manager.extract_prototypes(model, task_idx, dataloader.dataset, device)
     if task_idx > 0:
         old_prototypes = prototype_manager.prototypes[task_idx - 1]
-        complemented_prototypes = prototype_manager.complement_old_prototypes(old_prototypes, new_prototypes)
-        prototype_manager.prototypes[task_idx - 1] = complemented_prototypes
+        complemented = prototype_manager.complement_old_prototypes(old_prototypes, new_prototypes)
+        prototype_manager.prototypes[task_idx - 1] = complemented
 
     prototype_manager.prototypes[task_idx] = new_prototypes
 
 
-# Prepare CIFAR-10 dataset and split it into 5 tasks
-def prepare_dataloaders(task_idx, batch_size=64):
-    transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-
-    cifar10_train = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-    cifar10_test = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
-
-    # Split dataset into 5 tasks
-    num_classes_per_task = 2
-    classes_for_task = list(range(task_idx * num_classes_per_task, (task_idx + 1) * num_classes_per_task))
-
-    task_train_idx = [i for i, label in enumerate(cifar10_train.targets) if label in classes_for_task]
-    task_test_idx = [i for i, label in enumerate(cifar10_test.targets) if label in classes_for_task]
-
-    task_train_dataset = Subset(cifar10_train, task_train_idx)
-    task_test_dataset = Subset(cifar10_test, task_test_idx)
-
-    train_loader = DataLoader(task_train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(task_test_dataset, batch_size=batch_size, shuffle=False)
-
-    return train_loader, test_loader
-
-
-def main(num_tasks=5, epochs=2, batch_size=32):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    backbone = SimpleCNN().to(device)
-    model = EASE(backbone, adapter_dim=64).to(device)
-
-    prototype_manager = PrototypeManager()
-
-    for task_index in range(num_tasks):
-        print(f"Training on Task {task_index + 1}")
-
-        # data prep for current task
-        train_loader, test_loader = prepare_dataloaders(task_index, batch_size=batch_size)
-
-        # train model for current task
-        train_task(model, prototype_manager, train_loader, task_index, device, epochs=epochs)
-
-        print(f"Finished training on task {task_index + 1}")
-
+def evaluate_model(model, prototype_manager, test_loader, device, task_idx):
+    """Evaluate the model on the current task."""
     model.eval()
     correct = 0
     total = 0
 
     with torch.no_grad():
-        for task_index in range(num_tasks):
-            print(f"Evaluating on Task {task_index + 1}")
-            _, test_loader = prepare_dataloaders(task_index, batch_size=batch_size)
+        for inputs, labels in test_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            prototypes = prototype_manager.prototypes[task_idx]  # Current task prototypes
 
-            for images, labels in test_loader:
-                images, labels = images.to(device), labels.to(device)
+            # Perform weighted inference across all subspaces
+            logits_sum = weighted_inference(model, inputs, task_idx, prototypes)
+            _, predicted = torch.max(logits_sum, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
 
-                # Use the task-specific adapter for this task during evaluation
-                adapted_features = model(images, task_index)
-                _, predicted = torch.max(adapted_features, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
+    accuracy = 100 * correct / total
+    print(f"Task {task_idx}: Test Accuracy = {accuracy:.2f}%")
 
-    print(f"Overall accuracy on the test set after {num_tasks} tasks: {100 * correct / total:.2f}%")
+def prepare_dataloaders(task_idx, batch_size=64):
+    transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
+    train_data = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+    test_data = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+
+    # Select data for the specific task based on the task index
+    classes_per_task = 2  # Number of classes per task
+    task_classes = list(range(task_idx * classes_per_task, (task_idx + 1) * classes_per_task))
+    train_indices = [i for i, label in enumerate(train_data.targets) if label in task_classes]
+    test_indices = [i for i, label in enumerate(test_data.targets) if label in task_classes]
+
+    train_subset = Subset(train_data, train_indices)
+    test_subset = Subset(test_data, test_indices)
+
+    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False)
+
+    return train_loader, test_loader
+
+def main(num_tasks=5, epochs=2, batch_size=32):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = EASE(SimpleCNN(), reduction_dim=64).to(device)
+    prototype_manager = PrototypeManager()
+
+    for task_idx in range(num_tasks):
+        train_loader, test_loader = prepare_dataloaders(task_idx, batch_size)
+        train_task(model, prototype_manager, train_loader, task_idx, device, epochs)
+
+        # Evaluate the model after training on the current task
+        evaluate_model(model, prototype_manager, test_loader, device, task_idx)
+
+    print("Training and evaluation complete.")
 
 if __name__ == "__main__":
-    main(num_tasks=5)
+    main()
